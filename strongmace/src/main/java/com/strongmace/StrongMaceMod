@@ -1,0 +1,178 @@
+package com.strongmace;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.enchantment.Enchantments;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.item.SwordItem;
+import net.minecraft.text.Text;
+import org.lwjgl.glfw.GLFW;
+
+public class StrongMaceMod implements ClientModInitializer {
+
+    private static KeyBinding breachKey;
+    private static KeyBinding densityKey;
+    private static SwapMode currentMode = SwapMode.OFF;
+    private static int swapCooldownTicks = 0;
+    private static final int SWAP_COOLDOWN_DURATION = 5;
+    private static boolean wasAttacking = false;
+    private static int swapBackTicks = -1;
+    private static final int SWAP_BACK_DURATION = 3;
+    private static int savedMainSlot = -1;
+    private static int savedOtherSlot = -1;
+    private static ItemStack savedMainStack = ItemStack.EMPTY;
+    private static ItemStack savedOtherStack = ItemStack.EMPTY;
+
+    private enum SwapMode {
+        OFF("§7OFF"), BREACH("§bBREACH"), DENSITY("§dDENSITY");
+        private final String display;
+        SwapMode(String display) { this.display = display; }
+        public String getDisplay() { return display; }
+    }
+
+    @Override
+    public void onInitializeClient() {
+        breachKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.strongmace.breach", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT, "category.strongmace"));
+        densityKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.strongmace.density", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_LEFT, "category.strongmace"));
+
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (client.player == null) return;
+            if (swapCooldownTicks > 0) swapCooldownTicks--;
+
+            while (breachKey.wasPressed()) {
+                currentMode = (currentMode == SwapMode.BREACH) ? SwapMode.OFF : SwapMode.BREACH;
+                client.player.sendMessage(Text.literal("§6[StrongMace] " + currentMode.getDisplay()), false);
+            }
+            while (densityKey.wasPressed()) {
+                currentMode = (currentMode == SwapMode.DENSITY) ? SwapMode.OFF : SwapMode.DENSITY;
+                client.player.sendMessage(Text.literal("§6[StrongMace] " + currentMode.getDisplay()), false);
+            }
+
+            handleSwapBackTick(client);
+            if (currentMode != SwapMode.OFF) handleSwap(client);
+        });
+
+        HudRenderCallback.EVENT.register((drawContext, tickDelta) -> {
+            if (currentMode != SwapMode.OFF) renderModeHUD(drawContext);
+        });
+    }
+
+    private void renderModeHUD(DrawContext context) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return;
+        int screenWidth = client.getWindow().getScaledWidth();
+        int screenHeight = client.getWindow().getScaledHeight();
+        int x = screenWidth / 2 - 91;
+        int y = screenHeight - 49;
+        String displayText = currentMode.getDisplay();
+        int textWidth = client.textRenderer.getWidth(displayText);
+        context.fill(x - 2, y - 2, x + textWidth + 2, y + 10, 0x80000000);
+        context.drawText(client.textRenderer, Text.literal(displayText), x, y, 0xFFFFFF, true);
+    }
+
+    private void handleSwapBackTick(MinecraftClient client) {
+        if (swapBackTicks > 0) { swapBackTicks--; }
+        else if (swapBackTicks == 0) {
+            if (client.player != null) {
+                PlayerInventory inv = client.player.getInventory();
+                if (client.currentScreen == null && inv.selectedSlot == savedMainSlot && savedMainSlot != -1) {
+                    inv.setStack(savedMainSlot, savedMainStack.copy());
+                    inv.setStack(savedOtherSlot, savedOtherStack.copy());
+                }
+            }
+            swapBackTicks = -1; savedMainSlot = -1; savedOtherSlot = -1;
+            savedMainStack = ItemStack.EMPTY; savedOtherStack = ItemStack.EMPTY;
+        }
+    }
+
+    private void handleSwap(MinecraftClient client) {
+        if (client.player == null || client.world == null) return;
+        if (!client.world.isClient) return;
+        if (client.currentScreen != null) return;
+        if (client.player.getAttackCooldownProgress(0.5f) < 0.9f) return;
+        boolean isAttacking = client.options.attackKey.isPressed();
+        if (isAttacking && !wasAttacking) {
+            if (client.targetedEntity != null && client.targetedEntity instanceof PlayerEntity) {
+                performSwap(client.player);
+            }
+        }
+        wasAttacking = isAttacking;
+    }
+
+    private void performSwap(PlayerEntity player) {
+        if (swapCooldownTicks > 0) return;
+        if (swapBackTicks >= 0) return;
+        PlayerInventory inv = player.getInventory();
+        ItemStack mainHand = inv.getMainHandStack();
+        int mainSlot = inv.selectedSlot;
+
+        if (mainHand.getItem() instanceof SwordItem) {
+            int maceSlot = findMaceWithEnchantment(inv);
+            if (maceSlot == -1) { player.sendMessage(Text.literal("§c[StrongMace] No mace with " + currentMode.name() + " enchantment found!"), true); return; }
+            ItemStack maceStack = inv.getStack(maceSlot);
+            savedMainSlot = mainSlot; savedOtherSlot = maceSlot;
+            savedMainStack = mainHand.copy(); savedOtherStack = maceStack.copy();
+            inv.setStack(mainSlot, maceStack.copy());
+            inv.setStack(maceSlot, mainHand.copy());
+            swapCooldownTicks = SWAP_COOLDOWN_DURATION;
+            swapBackTicks = SWAP_BACK_DURATION;
+        } else if (mainHand.getItem() == Items.MACE) {
+            if (!hasCorrectEnchantment(mainHand)) { player.sendMessage(Text.literal("§c[StrongMace] Mace doesn't have " + currentMode.name() + " enchantment!"), true); return; }
+            int swordSlot = findSwordInHotbar(inv);
+            if (swordSlot == -1) { player.sendMessage(Text.literal("§c[StrongMace] No sword found in hotbar!"), true); return; }
+            ItemStack swordStack = inv.getStack(swordSlot);
+            savedMainSlot = mainSlot; savedOtherSlot = swordSlot;
+            savedMainStack = mainHand.copy(); savedOtherStack = swordStack.copy();
+            inv.setStack(mainSlot, swordStack.copy());
+            inv.setStack(swordSlot, mainHand.copy());
+            swapCooldownTicks = SWAP_COOLDOWN_DURATION;
+            swapBackTicks = SWAP_BACK_DURATION;
+        }
+    }
+
+    private int findMaceWithEnchantment(PlayerInventory inv) {
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (stack.getItem() == Items.MACE && hasCorrectEnchantment(stack)) return i;
+        }
+        return -1;
+    }
+
+    private int findSwordInHotbar(PlayerInventory inv) {
+        int bestSlot = -1, bestPriority = -1;
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (stack.getItem() instanceof SwordItem) {
+                int priority = getSwordPriority(stack);
+                if (priority > bestPriority) { bestPriority = priority; bestSlot = i; }
+            }
+        }
+        return bestSlot;
+    }
+
+    private int getSwordPriority(ItemStack stack) {
+        if (stack.getItem() == Items.NETHERITE_SWORD) return 5;
+        if (stack.getItem() == Items.DIAMOND_SWORD) return 4;
+        if (stack.getItem() == Items.IRON_SWORD) return 3;
+        if (stack.getItem() == Items.STONE_SWORD) return 2;
+        if (stack.getItem() == Items.GOLDEN_SWORD) return 1;
+        if (stack.getItem() == Items.WOODEN_SWORD) return 0;
+        return 0;
+    }
+
+    private boolean hasCorrectEnchantment(ItemStack stack) {
+        if (currentMode == SwapMode.BREACH) return EnchantmentHelper.getLevel(Enchantments.BREACH, stack) > 0;
+        if (currentMode == SwapMode.DENSITY) return EnchantmentHelper.getLevel(Enchantments.DENSITY, stack) > 0;
+        return false;
+    }
+}
